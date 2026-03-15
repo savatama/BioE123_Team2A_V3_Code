@@ -1,0 +1,96 @@
+/*
+  V3 Actuator Subsystem Test
+
+  Goal:
+  - Verify that the actuator side works: Arduino PWM -> MOSFET -> motor spins.
+
+  Serial commands:
+  - Type: PWM 120    (sets PWM to 120)
+  - Type: STEP       (runs an automatic step test)
+  - Type: OFF        (turn motor off)
+*/
+
+const int motorPWMPin = 6;     // V3 PWM output to MOSFET gate (Arduino Micro)
+const int readPin = A0;        // OPTIONAL: connect D6 -> A0 to read PWM average voltage
+
+int pwmVal = 0;
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(motorPWMPin, OUTPUT);
+  analogWrite(motorPWMPin, 0);
+
+  Serial.println("V3 Actuator Subsystem Test Ready");
+  Serial.println("Commands:");
+  Serial.println("  PWM <0-255>   (example: PWM 120)");
+  Serial.println("  STEP          (automatic step test)");
+  Serial.println("  OFF           (turn motor off)");
+  Serial.println("Optional: connect D6 -> A0 to read average PWM voltage.");
+}
+
+void loop() {
+  if (Serial.available() > 0) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    cmd.toUpperCase();
+
+    // OFF command
+    if (cmd == "OFF") {
+      pwmVal = 0;
+      analogWrite(motorPWMPin, pwmVal);
+      Serial.println("Motor OFF (PWM=0)");
+    }
+
+    // STEP command
+    else if (cmd == "STEP") {
+      Serial.println("Step test starting...");
+
+      int steps[] = {0, 60, 120, 180, 220, 255, 220, 180, 120, 60, 0};
+      int n = sizeof(steps) / sizeof(steps[0]);
+
+      for (int i = 0; i < n; i++) {
+        pwmVal = steps[i];
+        analogWrite(motorPWMPin, pwmVal);
+
+        // OPTIONAL voltage read
+        int adc = analogRead(readPin);
+        float v = adc * (5.0 / 1023.0);
+
+        Serial.print("PWM=");
+        Serial.print(pwmVal);
+        Serial.print("  approx Vavg on A0=");
+        Serial.println(v);
+
+        delay(2000);
+      }
+
+      Serial.println("Step test done.");
+    }
+
+    // PWM <value> command
+    else if (cmd.startsWith("PWM")) {
+      int spaceIndex = cmd.indexOf(' ');
+      if (spaceIndex > 0) {
+        int val = cmd.substring(spaceIndex + 1).toInt();
+        val = constrain(val, 0, 255);
+
+        pwmVal = val;
+        analogWrite(motorPWMPin, pwmVal);
+
+        int adc = analogRead(readPin);
+        float v = adc * (5.0 / 1023.0);
+
+        Serial.print("Set PWM=");
+        Serial.print(pwmVal);
+        Serial.print("  approx Vavg on A0=");
+        Serial.println(v);
+      } else {
+        Serial.println("Format: PWM <0-255>  (example: PWM 120)");
+      }
+    }
+
+    else {
+      Serial.println("Unknown command. Try: PWM 120, STEP, OFF");
+    }
+  }
+}
