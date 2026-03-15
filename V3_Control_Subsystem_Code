@@ -1,0 +1,433 @@
+/*
+  V3 Centrifuge CONTROL
+
+  What this does:
+  - Sensor: counts pulses on interrupt pin 7, computes measuredRPM every time window
+  - Actuator: outputs PWM on pin 6 to the MOSFET gate
+  - Control: proportional-integral (PI) control
+      error = targetRPM - controlRPM
+      controlEffort = Kp*error + Ki*integralError
+      newPWM = currentPWM + controlEffort
+    then clamp to 0-255 and write to the motor
+  - Includes V3 sensor improvements:
+      - glitch reject
+      - pulsesPerRev scaling
+      - low-pass filtered controlRPM
+      - sensor failure detection
+      - rampdown state
+
+  Serial Monitor instructions:
+  1) Enter target RPM (example: 1500) press Enter
+  2) Enter spin time (seconds) (example: 30) press Enter
+  3) Type 's' to start
+  4) Type 'x' to stop / rampdown
+  5) Type 'r' to reset RPM/time
+
+  Optional live tuning:
+    KP 0.10
+    KI 0.015
+*/
+
+volatile unsigned long rotationCounter = 0;
+
+// ISR glitch reject 
+volatile unsigned long lastPulseMicros = 0;
+const unsigned long minPulseIntervalMicros = 2000;
+
+// Pulse scaling
+const float pulsesPerRev = 6.0;
+
+//  Pins
+const int interruptPin = 7;
+const int motorPWMPin  = 6;
+
+const bool useInterruptPullup = true;
+const int interruptEdgeMode = FALLING;
+
+// User inputs 
+int targetRPM = 0;
+unsigned long spinTimeMs = 0;
+
+//  Run state
+enum RunState { IDLE, RUNNING, RAMPDOWN };
+RunState state = IDLE;
+
+unsigned long startTime = 0;
+
+// RPM timing 
+const unsigned long rpmWindowMs = 250;
+unsigned long lastRPMTime = 0;
+
+float measuredRPM = 0;
+float filteredRPM = 0;
+float controlRPM = 0;
+
+// Spike clamp
+const float maxDeltaRPMPerWindow = 1200.0;
+
+// PI control
+float Kp = 0.10;
+float Ki = 0.015;
+float integralError = 0.0;
+const float integralMax = 4000.0;
+const float integralEnableFraction = 0.60;
+
+int currentPWM = 0;
+const float controlAlpha = 0.75;
+
+// Rampdown
+const int rampdownStepPWM = 12;
+const float stopRPMThreshold = 30.0;
+const int stopConfirmWindows = 2;
+int lowRPMCount = 0;
+
+// Sensor fault detection
+const int minPWMForSensorCheck = 80;
+const int sensorFailConfirmWindows = 3;
+int zeroCountWindows = 0;
+bool sensorFaultLatched = false;
+
+// Done guard
+bool printedDoneOnce = false;
+
+// ISR
+void rotationISR() {
+  unsigned long now = micros();
+  unsigned long dt = now - lastPulseMicros;
+
+  if (dt >= minPulseIntervalMicros) {
+    lastPulseMicros = now;
+    rotationCounter++;
+  }
+}
+
+void resetControlState() {
+  measuredRPM = 0;
+  filteredRPM = 0;
+  controlRPM = 0;
+  integralError = 0.0;
+}
+
+void resetSensorFailureState() {
+  zeroCountWindows = 0;
+  sensorFaultLatched = false;
+}
+
+void resetPulseState() {
+  noInterrupts();
+  rotationCounter = 0;
+  lastPulseMicros = micros();
+  interrupts();
+}
+
+void checkSensorFailure(unsigned long countsThisWindow) {
+  if (state != RUNNING) {
+    zeroCountWindows = 0;
+    return;
+  }
+
+  if (currentPWM >= minPWMForSensorCheck && countsThisWindow == 0) {
+    zeroCountWindows++;
+  } else {
+    zeroCountWindows = 0;
+  }
+
+  if (zeroCountWindows >= sensorFailConfirmWindows) {
+    sensorFaultLatched = true;
+    state = RAMPDOWN;
+    integralError = 0.0;
+    lowRPMCount = 0;
+    Serial.println("SENSOR_FAULT");
+  }
+}
+
+void setup() {
+  Serial.begin(9600);
+  Serial.setTimeout(25);
+
+  if (useInterruptPullup) {
+    pinMode(interruptPin, INPUT_PULLUP);
+  } else {
+    pinMode(interruptPin, INPUT);
+  }
+
+  pinMode(motorPWMPin, OUTPUT);
+  analogWrite(motorPWMPin, 0);
+
+  attachInterrupt(digitalPinToInterrupt(interruptPin), rotationISR, interruptEdgeMode);
+
+  Serial.println("V3 Control Code Ready (PI control)");
+  Serial.print("Current Kp = ");
+  Serial.println(Kp);
+  Serial.print("Current Ki = ");
+  Serial.println(Ki);
+  Serial.println("Enter target RPM (ex: 1500), press Enter:");
+}
+
+void handleSerial() {
+  if (Serial.available() <= 0) return;
+
+  char c = Serial.peek();
+
+  if (c == 's' || c == 'S') {
+    Serial.read();
+
+    if (targetRPM <= 0 || spinTimeMs == 0) {
+      Serial.println("Set RPM and TIME first.");
+    } else {
+      state = RUNNING;
+      printedDoneOnce = false;
+      lowRPMCount = 0;
+
+      startTime = millis();
+      lastRPMTime = millis();
+
+      resetPulseState();
+      resetControlState();
+      resetSensorFailureState();
+
+      currentPWM = map(targetRPM, 0, 1950, 0, 255);
+      currentPWM = constrain(currentPWM, 0, 255);
+      analogWrite(motorPWMPin, currentPWM);
+
+      Serial.println("STARTING...");
+      Serial.println("Type 'x' to stop, 'r' to reset.");
+    }
+    return;
+  }
+
+  if (c == 'x' || c == 'X') {
+    Serial.read();
+
+    if (state == RUNNING) {
+      state = RAMPDOWN;
+      integralError = 0.0;
+      lowRPMCount = 0;
+      printedDoneOnce = false;
+      Serial.println("STOP REQUESTED: ramping down.");
+    } else {
+      state = IDLE;
+      analogWrite(motorPWMPin, 0);
+      Serial.println("STOPPED.");
+    }
+    return;
+  }
+
+  if (c == 'r' || c == 'R') {
+    Serial.read();
+
+    state = IDLE;
+    analogWrite(motorPWMPin, 0);
+
+    targetRPM = 0;
+    spinTimeMs = 0;
+    currentPWM = 0;
+
+    resetControlState();
+    resetSensorFailureState();
+    resetPulseState();
+
+    printedDoneOnce = false;
+    lowRPMCount = 0;
+
+    Serial.println("Reset done. Enter target RPM again:");
+    return;
+  }
+
+  String line = Serial.readStringUntil('\n');
+  line.trim();
+
+  if (line.length() == 0) return;
+
+  String upperLine = line;
+  upperLine.toUpperCase();
+
+  if (upperLine.startsWith("KP")) {
+    int spaceIndex = upperLine.indexOf(' ');
+    if (spaceIndex > 0) {
+      float newKp = line.substring(spaceIndex + 1).toFloat();
+      if (newKp > 0) {
+        Kp = newKp;
+        Serial.print("Updated Kp to ");
+        Serial.println(Kp);
+      } else {
+        Serial.println("KP value must be > 0");
+      }
+    } else {
+      Serial.println("Format: KP 0.10");
+    }
+    return;
+  }
+
+  if (upperLine.startsWith("KI")) {
+    int spaceIndex = upperLine.indexOf(' ');
+    if (spaceIndex > 0) {
+      float newKi = line.substring(spaceIndex + 1).toFloat();
+      if (newKi >= 0) {
+        Ki = newKi;
+        Serial.print("Updated Ki to ");
+        Serial.println(Ki);
+      } else {
+        Serial.println("KI value must be >= 0");
+      }
+    } else {
+      Serial.println("Format: KI 0.015");
+    }
+    return;
+  }
+
+  int val = line.toInt();
+  if (val > 0) {
+    if (targetRPM == 0) {
+      targetRPM = val;
+      Serial.print("targetRPM set to ");
+      Serial.println(targetRPM);
+      Serial.println("Enter spin time (seconds), press Enter:");
+    } else if (spinTimeMs == 0) {
+      spinTimeMs = (unsigned long)val * 1000UL;
+      Serial.print("spinTime set to ");
+      Serial.print(val);
+      Serial.println(" seconds");
+      Serial.println("Type 's' to start.");
+    } else {
+      targetRPM = val;
+      Serial.print("updated targetRPM to ");
+      Serial.println(targetRPM);
+    }
+  }
+}
+
+bool updateRPM() {
+  unsigned long now = millis();
+  if (now - lastRPMTime < rpmWindowMs) return false;
+
+  unsigned long dt = now - lastRPMTime;
+  lastRPMTime = now;
+
+  noInterrupts();
+  unsigned long counts = rotationCounter;
+  rotationCounter = 0;
+  interrupts();
+
+  float dtSec = dt / 1000.0;
+  float rawRPM = 0.0;
+
+  if (dtSec > 0) {
+    rawRPM = ((counts / pulsesPerRev) / dtSec) * 60.0;
+  }
+
+  if (filteredRPM == 0) {
+    filteredRPM = rawRPM;
+  }
+
+  float delta = rawRPM - filteredRPM;
+  if (delta > maxDeltaRPMPerWindow) rawRPM = filteredRPM + maxDeltaRPMPerWindow;
+  if (delta < -maxDeltaRPMPerWindow) rawRPM = filteredRPM - maxDeltaRPMPerWindow;
+
+  filteredRPM = rawRPM;
+  measuredRPM = filteredRPM;
+
+  if (controlRPM == 0) {
+    controlRPM = measuredRPM;
+  } else {
+    controlRPM = controlAlpha * controlRPM + (1.0 - controlAlpha) * measuredRPM;
+  }
+
+  checkSensorFailure(counts);
+  return true;
+}
+
+void updateControlAndMotor() {
+  float error = (float)targetRPM - controlRPM;
+
+  if (targetRPM > 0 && controlRPM >= integralEnableFraction * targetRPM) {
+    integralError += error;
+  }
+
+  integralError = constrain(integralError, -integralMax, integralMax);
+
+  float controlEffort = Kp * error + Ki * integralError;
+  float newPWMFloat = (float)currentPWM + controlEffort;
+
+  int newPWM = (int)newPWMFloat;
+  newPWM = constrain(newPWM, 0, 255);
+
+  currentPWM = newPWM;
+  analogWrite(motorPWMPin, currentPWM);
+
+  Serial.print("Error: ");
+  Serial.print(error);
+  Serial.print("  Int: ");
+  Serial.print(integralError);
+  Serial.print("  RPM: ");
+  Serial.print(measuredRPM);
+  Serial.print("  RPMctrl: ");
+  Serial.print(controlRPM);
+  Serial.print("  target: ");
+  Serial.print(targetRPM);
+  Serial.print("  PWM: ");
+  Serial.println(currentPWM);
+}
+
+void updateRampdown() {
+  if (currentPWM > 0) {
+    currentPWM -= rampdownStepPWM;
+    if (currentPWM < 0) currentPWM = 0;
+    analogWrite(motorPWMPin, currentPWM);
+  } else {
+    analogWrite(motorPWMPin, 0);
+  }
+
+  if (measuredRPM <= stopRPMThreshold) {
+    lowRPMCount++;
+  } else {
+    lowRPMCount = 0;
+  }
+
+  if (lowRPMCount >= stopConfirmWindows) {
+    state = IDLE;
+    analogWrite(motorPWMPin, 0);
+
+    if (!printedDoneOnce) {
+      Serial.println("Centrifugation Done");
+      printedDoneOnce = true;
+    }
+  } else {
+    Serial.print("RAMPDOWN  RPM: ");
+    Serial.print(measuredRPM);
+    Serial.print("  PWM: ");
+    Serial.println(currentPWM);
+  }
+}
+
+void checkTimeAndTransitionIfDone() {
+  if (state == RUNNING) {
+    if (millis() - startTime >= spinTimeMs) {
+      state = RAMPDOWN;
+      integralError = 0.0;
+      lowRPMCount = 0;
+      printedDoneOnce = false;
+      Serial.println("Time complete: ramping down...");
+    }
+  }
+}
+
+void loop() {
+  handleSerial();
+
+  bool newRPM = updateRPM();
+
+  if (newRPM) {
+    if (state == RUNNING) {
+      updateControlAndMotor();
+    } else if (state == RAMPDOWN) {
+      updateRampdown();
+    }
+  }
+
+  checkTimeAndTransitionIfDone();
+
+  if (state == IDLE) {
+    analogWrite(motorPWMPin, 0);
+  }
+}
